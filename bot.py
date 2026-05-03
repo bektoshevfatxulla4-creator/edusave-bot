@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 📚 EduSave Bot — O'quv materiallarini kategoriyalarda saqlash boti
@@ -30,6 +31,10 @@ logger = logging.getLogger(__name__)
 
 DB_PATH        = "edusave.db"
 ITEMS_PER_PAGE = 5
+
+# ─────────────────────────── ADMIN ────────────────────────────────
+# Admin user ID — faqat siz admin paneli ko'ra olasiz
+ADMIN_ID = 7855999182  # ← Sizning Telegram user ID
 
 # ─────────────────────────── MAJBURIY OBUNA ──────────────────────
 # Kanal username — @ belgisi bilan yozing (masalan: "@edusave_kanal")
@@ -99,6 +104,13 @@ def get_conn():
 def init_db():
     with get_conn() as conn:
         conn.executescript('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id      INTEGER PRIMARY KEY,
+                username     TEXT,
+                first_name   TEXT,
+                first_seen   TEXT DEFAULT (datetime('now')),
+                last_seen    TEXT DEFAULT (datetime('now'))
+            );
             CREATE TABLE IF NOT EXISTS categories (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id    INTEGER NOT NULL,
@@ -122,6 +134,54 @@ def init_db():
                 FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE CASCADE
             );
         ''')
+
+# ─────────────────────────── USER TRACKING ───────────────────────
+
+def track_user(user_id: int, username: str = None, first_name: str = None):
+    """Foydalanuvchini bazaga qo'shadi yoki yangilaydi."""
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO users (user_id, username, first_name) VALUES (?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET "
+            "  username=excluded.username, "
+            "  first_name=excluded.first_name, "
+            "  last_seen=datetime('now')",
+            (user_id, username, first_name)
+        )
+
+def get_admin_stats():
+    """Admin uchun statistika."""
+    with get_conn() as conn:
+        total_users    = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        today_users    = conn.execute("SELECT COUNT(*) FROM users WHERE date(first_seen)=date('now')").fetchone()[0]
+        week_users     = conn.execute("SELECT COUNT(*) FROM users WHERE first_seen >= datetime('now','-7 days')").fetchone()[0]
+        active_today   = conn.execute("SELECT COUNT(*) FROM users WHERE date(last_seen)=date('now')").fetchone()[0]
+        total_cats     = conn.execute("SELECT COUNT(*) FROM categories").fetchone()[0]
+        total_items    = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+        top_users = conn.execute(
+            "SELECT u.user_id, u.first_name, u.username, "
+            "       (SELECT COUNT(*) FROM items WHERE user_id=u.user_id) as item_cnt "
+            "FROM users u "
+            "ORDER BY item_cnt DESC LIMIT 5"
+        ).fetchall()
+    return {
+        'total_users':  total_users,
+        'today_users':  today_users,
+        'week_users':   week_users,
+        'active_today': active_today,
+        'total_cats':   total_cats,
+        'total_items':  total_items,
+        'top_users':    top_users,
+    }
+
+def get_recent_users(limit=10):
+    """So'nggi foydalanuvchilar."""
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT user_id, first_name, username, first_seen FROM users "
+            "ORDER BY first_seen DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
 
 # ─────────────────────────── DB HELPERS ──────────────────────────
 
@@ -421,6 +481,9 @@ def item_actions_kb(item_id, cat_id, page, is_fav, msg_type):
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     logger.info(f"🟢 /start dan: user_id={update.effective_user.id}, name={update.effective_user.first_name}")
+    # Foydalanuvchini ro'yxatga olamiz
+    u = update.effective_user
+    track_user(u.id, u.username, u.first_name)
     if not await require_subscription(update, ctx):
         logger.info(f"🔴 Obuna emas, to'xtatildi: {update.effective_user.id}")
         return
@@ -440,6 +503,134 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Istalgan xabar yuboring → kategoriyani tanlang → tayyor! ✅"
     )
     await update.message.reply_text(text, reply_markup=main_menu_kb(), parse_mode="HTML")
+
+# ─────────────────────────── ADMIN PANEL ─────────────────────────
+
+def admin_menu_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 Foydalanuvchilar", callback_data="admin_users"),
+         InlineKeyboardButton("📊 Statistika",       callback_data="admin_stats")],
+        [InlineKeyboardButton("🆕 So'nggi qo'shilganlar", callback_data="admin_recent")],
+        [InlineKeyboardButton("📢 Barchaga xabar yuborish", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("🔙 Asosiy menyu", callback_data="main_menu")],
+    ])
+
+async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin paneli — faqat ADMIN_ID ko'rishi mumkin."""
+    uid = update.effective_user.id
+    if uid != ADMIN_ID:
+        await update.message.reply_text("❌ Sizda admin huquqlari yo'q")
+        return
+    stats = get_admin_stats()
+    text = (
+        "👨‍💼 <b>Admin Paneli</b>\n\n"
+        f"👥 Jami foydalanuvchilar: <b>{stats['total_users']}</b>\n"
+        f"🆕 Bugun qo'shilganlar: <b>{stats['today_users']}</b>\n"
+        f"📅 Bu hafta qo'shilganlar: <b>{stats['week_users']}</b>\n"
+        f"🟢 Bugun faol: <b>{stats['active_today']}</b>\n\n"
+        f"📁 Jami kategoriyalar: <b>{stats['total_cats']}</b>\n"
+        f"📦 Jami materiallar: <b>{stats['total_items']}</b>"
+    )
+    await update.message.reply_text(text, reply_markup=admin_menu_kb(), parse_mode="HTML")
+
+async def cb_admin_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if q.from_user.id != ADMIN_ID:
+        return
+    stats = get_admin_stats()
+    lines = [
+        "📊 <b>To'liq statistika</b>\n",
+        f"👥 Jami foydalanuvchilar: <b>{stats['total_users']}</b>",
+        f"🆕 Bugun qo'shilganlar: <b>{stats['today_users']}</b>",
+        f"📅 Bu hafta qo'shilganlar: <b>{stats['week_users']}</b>",
+        f"🟢 Bugun faol: <b>{stats['active_today']}</b>",
+        f"📁 Jami kategoriyalar: <b>{stats['total_cats']}</b>",
+        f"📦 Jami materiallar: <b>{stats['total_items']}</b>",
+    ]
+    if stats['top_users']:
+        lines.append("\n🏆 <b>Top 5 foydalanuvchi (materiallar bo'yicha):</b>")
+        for i, (uid, fname, uname, cnt) in enumerate(stats['top_users'], 1):
+            display = fname or uname or f"User {uid}"
+            lines.append(f"  {i}. {display} — {cnt} ta")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Orqaga", callback_data="admin_back")]])
+    await q.edit_message_text("\n".join(lines), reply_markup=kb, parse_mode="HTML")
+
+async def cb_admin_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if q.from_user.id != ADMIN_ID:
+        return
+    with get_conn() as conn:
+        users = conn.execute(
+            "SELECT user_id, first_name, username, first_seen, last_seen FROM users "
+            "ORDER BY last_seen DESC LIMIT 20"
+        ).fetchall()
+    if not users:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Orqaga", callback_data="admin_back")]])
+        await q.edit_message_text("👥 Foydalanuvchilar yo'q", reply_markup=kb)
+        return
+    lines = [f"👥 <b>So'nggi 20 foydalanuvchi (faollik bo'yicha):</b>\n"]
+    for uid, fname, uname, first_seen, last_seen in users:
+        display = fname or "Noma'lum"
+        username_str = f" (@{uname})" if uname else ""
+        lines.append(f"• <b>{display}</b>{username_str}\n  └ ID: <code>{uid}</code> | Oxirgi: {last_seen[:16]}")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Orqaga", callback_data="admin_back")]])
+    await q.edit_message_text("\n".join(lines), reply_markup=kb, parse_mode="HTML")
+
+async def cb_admin_recent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if q.from_user.id != ADMIN_ID:
+        return
+    users = get_recent_users(15)
+    if not users:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Orqaga", callback_data="admin_back")]])
+        await q.edit_message_text("🆕 Yangi foydalanuvchilar yo'q", reply_markup=kb)
+        return
+    lines = [f"🆕 <b>So'nggi 15 yangi foydalanuvchi:</b>\n"]
+    for uid, fname, uname, first_seen in users:
+        display = fname or "Noma'lum"
+        username_str = f" (@{uname})" if uname else ""
+        lines.append(f"• <b>{display}</b>{username_str}\n  └ Qo'shildi: {first_seen[:16]}")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Orqaga", callback_data="admin_back")]])
+    await q.edit_message_text("\n".join(lines), reply_markup=kb, parse_mode="HTML")
+
+async def cb_admin_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin paneliga qaytish."""
+    q = update.callback_query
+    await q.answer()
+    if q.from_user.id != ADMIN_ID:
+        return
+    stats = get_admin_stats()
+    text = (
+        "👨‍💼 <b>Admin Paneli</b>\n\n"
+        f"👥 Jami foydalanuvchilar: <b>{stats['total_users']}</b>\n"
+        f"🆕 Bugun qo'shilganlar: <b>{stats['today_users']}</b>\n"
+        f"📅 Bu hafta qo'shilganlar: <b>{stats['week_users']}</b>\n"
+        f"🟢 Bugun faol: <b>{stats['active_today']}</b>\n\n"
+        f"📁 Jami kategoriyalar: <b>{stats['total_cats']}</b>\n"
+        f"📦 Jami materiallar: <b>{stats['total_items']}</b>"
+    )
+    await q.edit_message_text(text, reply_markup=admin_menu_kb(), parse_mode="HTML")
+
+async def cb_admin_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Hamma foydalanuvchilarga xabar yuborish."""
+    q = update.callback_query
+    await q.answer()
+    if q.from_user.id != ADMIN_ID:
+        return
+    ctx.user_data['state'] = 'broadcast'
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Bekor qilish", callback_data="admin_back")]])
+    await q.edit_message_text(
+        "📢 <b>Barchaga xabar yuborish</b>\n\n"
+        "Yubormoqchi bo'lgan xabaringizni yozing.\n"
+        "Format saqlanadi (bold, italic, link va h.k.).\n\n"
+        "⚠️ Diqqat: barcha foydalanuvchilarga yuboriladi!",
+        reply_markup=kb, parse_mode="HTML"
+    )
+
+# ─────────────────────────────────────────────────────────────────
 
 async def cb_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -894,11 +1085,44 @@ async def cb_check_sub(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── Message handler ───────────────────────────────────────────────
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Foydalanuvchini ro'yxatga olamiz (har xabarda last_seen yangilanadi)
+    u = update.effective_user
+    track_user(u.id, u.username, u.first_name)
+
     if not await require_subscription(update, ctx):
         return
     uid   = update.effective_user.id
     msg   = update.message
     state = ctx.user_data.get("state")
+
+    # ── Admin broadcast rejimi ─────────────────────────────────────
+    if state == "broadcast" and uid == ADMIN_ID:
+        ctx.user_data.clear()
+        text = msg.text or msg.caption or ""
+        if not text:
+            await msg.reply_text("❌ Matn yuboring (rasm/video bilan caption ham bo'ladi)")
+            return
+
+        # Barcha foydalanuvchilarni olamiz
+        with get_conn() as conn:
+            all_users = [r[0] for r in conn.execute("SELECT user_id FROM users").fetchall()]
+
+        await msg.reply_text(f"⏳ {len(all_users)} ta foydalanuvchiga yuborilmoqda…")
+
+        sent, failed = 0, 0
+        for user_id in all_users:
+            try:
+                await ctx.bot.send_message(user_id, text, parse_mode="HTML")
+                sent += 1
+            except Exception:
+                failed += 1
+        await msg.reply_text(
+            f"✅ <b>Tugadi!</b>\n"
+            f"📤 Yuborildi: <b>{sent}</b>\n"
+            f"❌ Xato: <b>{failed}</b>",
+            parse_mode="HTML", reply_markup=admin_menu_kb() if uid == ADMIN_ID else main_menu_kb()
+        )
+        return
 
     # ── ZIP rejim: yuborilgan fayllarni to'plash ──────────────────
     if state == "zip_mode":
@@ -1078,6 +1302,7 @@ def main():
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu",  cmd_start))
+    app.add_handler(CommandHandler("admin", cmd_admin))
     cb_map = {
         "^main_menu$":         cb_main_menu,
         "^cat_list$":          cb_cat_list,
@@ -1100,6 +1325,11 @@ def main():
         "^zip_finish$":        cb_zip_finish,
         "^zip_cancel$":        cb_zip_cancel,
         "^check_sub$":         cb_check_sub,
+        "^admin_users$":       cb_admin_users,
+        "^admin_stats$":       cb_admin_stats,
+        "^admin_recent$":      cb_admin_recent,
+        "^admin_back$":        cb_admin_back,
+        "^admin_broadcast$":   cb_admin_broadcast,
         "^noop$":              cb_noop,
     }
     for pattern, handler in cb_map.items():
