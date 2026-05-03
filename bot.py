@@ -10,9 +10,11 @@ import sqlite3
 import os
 import io
 import zipfile
+import threading
 from datetime import datetime
 
 from PIL import Image
+from flask import Flask
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -28,6 +30,64 @@ logger = logging.getLogger(__name__)
 
 DB_PATH        = "edusave.db"
 ITEMS_PER_PAGE = 5
+
+# ─────────────────────────── MAJBURIY OBUNA ──────────────────────
+# Kanal username — @ belgisi bilan yozing (masalan: "@edusave_kanal")
+# Agar majburiy obuna kerak bo'lmasa, REQUIRED_CHANNEL = None qiling
+REQUIRED_CHANNEL = "@paradox_sigma"   # ← Shu yerga o'z kanalingizni yozing
+CHANNEL_LINK     = "https://t.me/paradox_sigma"  # ← Kanalga link
+
+async def is_subscribed(bot, user_id: int) -> bool:
+    """Foydalanuvchi kanalga obuna ekanligini tekshiradi."""
+    if not REQUIRED_CHANNEL:
+        return True
+    try:
+        member = await bot.get_chat_member(REQUIRED_CHANNEL, user_id)
+        status = member.status
+        logger.info(f"User {user_id} status in {REQUIRED_CHANNEL}: {status}")
+        # 'left' va 'kicked' — obuna emas; qolgan barcha statuslar — obuna
+        return status not in ("left", "kicked")
+    except Exception as e:
+        logger.error(f"❌ is_subscribed error for {user_id}: {e}")
+        logger.error(f"   Bot {REQUIRED_CHANNEL} ga admin qilinganmi? Kanal username to'g'rimi?")
+        # Xato chiqsa - obuna yo'q deb hisoblaymiz (xavfsizroq)
+        return False
+
+def subscribe_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Kanalga obuna bo'lish", url=CHANNEL_LINK)],
+        [InlineKeyboardButton("✅ Tekshirish",            callback_data="check_sub")],
+    ])
+
+async def require_subscription(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Foydalanuvchini tekshiradi. Obuna bo'lmasa - majburiy obuna xabarini chiqaradi.
+    True qaytarsa - obuna bor, davom etish mumkin
+    False qaytarsa - obuna yo'q, to'xtatish kerak
+    """
+    uid = update.effective_user.id
+    if await is_subscribed(ctx.bot, uid):
+        return True
+
+    text = (
+        "🔒 <b>Botdan foydalanish uchun kanalimizga obuna bo'ling!</b>\n\n"
+        "1. Quyidagi tugma orqali kanalga o'ting\n"
+        "2. Obuna bo'ling\n"
+        "3. <b>✅ Tekshirish</b> tugmasini bosing"
+    )
+    if update.callback_query:
+        try:
+            await update.callback_query.answer("🔒 Avval kanalga obuna bo'ling!", show_alert=True)
+            await update.callback_query.edit_message_text(
+                text, reply_markup=subscribe_kb(), parse_mode="HTML"
+            )
+        except Exception:
+            await update.callback_query.message.reply_text(
+                text, reply_markup=subscribe_kb(), parse_mode="HTML"
+            )
+    elif update.message:
+        await update.message.reply_text(text, reply_markup=subscribe_kb(), parse_mode="HTML")
+    return False
 
 # ─────────────────────────── DATABASE ────────────────────────────
 
@@ -295,7 +355,8 @@ def main_menu_kb():
          InlineKeyboardButton("🔍 Qidirish",      callback_data="search_start")],
         [InlineKeyboardButton("➕ Kategoriya",    callback_data="cat_add"),
          InlineKeyboardButton("⭐ Sevimlilar",    callback_data="favorites")],
-        [InlineKeyboardButton("📊 Statistika",    callback_data="stats")],
+        [InlineKeyboardButton("📊 Statistika",    callback_data="stats"),
+         InlineKeyboardButton("📦 ZIP qilish",    callback_data="zip_mode")],
     ])
 
 def back_btn(target="main_menu"):
@@ -359,6 +420,11 @@ def item_actions_kb(item_id, cat_id, page, is_fav, msg_type):
 # ──────────────────────────── HANDLERS ───────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"🟢 /start dan: user_id={update.effective_user.id}, name={update.effective_user.first_name}")
+    if not await require_subscription(update, ctx):
+        logger.info(f"🔴 Obuna emas, to'xtatildi: {update.effective_user.id}")
+        return
+    logger.info(f"🟢 Obuna tasdiqlandi: {update.effective_user.id}")
     name = update.effective_user.first_name
     text = (
         f"👋 Salom, <b>{name}</b>!\n\n"
@@ -682,6 +748,102 @@ async def cb_zip_cat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         logger.error(f"zip_cat error: {e}")
         await status_msg.edit_text(f"❌ ZIP yaratishda xato: {e}")
 
+# ─────────────────── 📦 ZIP MODE (instant) ─────────────────────
+
+async def cb_zip_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Foydalanuvchini ZIP rejimga o'tkazadi — yuborilgan fayllarni darhol ZIP qiladi."""
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data['state'] = 'zip_mode'
+    ctx.user_data['zip_files'] = []  # to'plangan fayllar ro'yxati
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ ZIP qilib yuborish", callback_data="zip_finish")],
+        [InlineKeyboardButton("❌ Bekor qilish",       callback_data="zip_cancel")],
+    ])
+    await q.edit_message_text(
+        "📦 <b>ZIP qilish rejimi</b>\n\n"
+        "Endi menga fayllarni yuboring (rasm, hujjat, video, audio).\n"
+        "Bir nechta fayl yuborsangiz — hammasini bitta ZIP ga qo'shaman.\n\n"
+        "Tayyor bo'lgach <b>✅ ZIP qilib yuborish</b> tugmasini bosing.",
+        reply_markup=kb, parse_mode="HTML"
+    )
+
+async def cb_zip_finish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """To'plangan fayllarni ZIP qilib yuboradi."""
+    q = update.callback_query
+    await q.answer("⏳ ZIP yaratilmoqda…")
+    files = ctx.user_data.get('zip_files', [])
+    ctx.user_data.clear()
+
+    if not files:
+        await q.edit_message_text(
+            "📭 Hech qanday fayl yuborilmadi!",
+            reply_markup=main_menu_kb()
+        )
+        return
+
+    status_msg = await q.message.reply_text(
+        f"⏳ {len(files)} ta fayl ZIP qilinmoqda, biroz kuting…"
+    )
+    try:
+        zip_buf = io.BytesIO()
+        counters = {}
+        total_original = 0
+        with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+            for idx, finfo in enumerate(files, 1):
+                try:
+                    data = await download_file(ctx.bot, finfo['file_id'])
+                except Exception as e:
+                    logger.warning(f"ZIP skip: {e}")
+                    continue
+                total_original += len(data)
+                # Arxiv ichidagi nomni aniqlash
+                if finfo.get('file_name'):
+                    arc_name = finfo['file_name']
+                else:
+                    ext = {"photo": "jpg", "video": "mp4", "audio": "mp3", "voice": "ogg"}.get(finfo['msg_type'], "bin")
+                    arc_name = f"{finfo['msg_type']}_{idx}.{ext}"
+                # Takrorlanishni oldini olish
+                if arc_name in counters:
+                    counters[arc_name] += 1
+                    base, _, ext2 = arc_name.rpartition(".")
+                    arc_name = f"{base}_{counters[arc_name]}.{ext2}" if ext2 else f"{arc_name}_{counters[arc_name]}"
+                else:
+                    counters[arc_name] = 0
+                zf.writestr(arc_name, data)
+
+        zip_buf.seek(0)
+        zip_data = zip_buf.read()
+        zip_size = len(zip_data)
+        ratio = 100 - (zip_size / total_original * 100) if total_original else 0
+        zip_filename = f"fayllar_{datetime.now().strftime('%Y%m%d_%H%M')}.zip"
+
+        await status_msg.delete()
+        await q.message.reply_document(
+            io.BytesIO(zip_data),
+            filename=zip_filename,
+            caption=(
+                f"📦 <b>ZIP arxiv tayyor!</b>\n"
+                f"📎 {len(files)} ta fayl\n"
+                f"📏 Avval: <b>{human_size(total_original)}</b>\n"
+                f"📉 Keyin: <b>{human_size(zip_size)}</b> "
+                f"(<b>-{ratio:.0f}%</b>)"
+            ),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏠 Menyu", callback_data="main_menu")
+            ]])
+        )
+    except Exception as e:
+        logger.error(f"zip_finish error: {e}")
+        await status_msg.edit_text(f"❌ ZIP yaratishda xato: {e}")
+
+async def cb_zip_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer("❌ Bekor qilindi")
+    ctx.user_data.clear()
+    await q.edit_message_text("🏠 <b>Asosiy menyu</b>", reply_markup=main_menu_kb(), parse_mode="HTML")
+
 # ─────────────────── SAVE / STATE HANDLERS ───────────────────────
 
 async def cb_save_to(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -715,12 +877,62 @@ async def cb_save_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cb_noop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
 
+async def cb_check_sub(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Obuna tekshirish tugmasi."""
+    q = update.callback_query
+    uid = q.from_user.id
+    if await is_subscribed(ctx.bot, uid):
+        await q.answer("✅ Obuna tasdiqlandi!", show_alert=True)
+        await q.edit_message_text(
+            "🏠 <b>Asosiy menyu</b>",
+            reply_markup=main_menu_kb(),
+            parse_mode="HTML"
+        )
+    else:
+        await q.answer("❌ Hali obuna bo'lmagansiz!", show_alert=True)
+
 # ── Message handler ───────────────────────────────────────────────
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await require_subscription(update, ctx):
+        return
     uid   = update.effective_user.id
     msg   = update.message
     state = ctx.user_data.get("state")
+
+    # ── ZIP rejim: yuborilgan fayllarni to'plash ──────────────────
+    if state == "zip_mode":
+        m = msg
+        msg_type = file_id = file_name = None
+
+        if m.photo:
+            msg_type = "photo";    file_id = m.photo[-1].file_id
+        elif m.document:
+            msg_type = "document"; file_id = m.document.file_id; file_name = m.document.file_name
+        elif m.video:
+            msg_type = "video";    file_id = m.video.file_id;    file_name = m.video.file_name
+        elif m.audio:
+            msg_type = "audio";    file_id = m.audio.file_id;    file_name = m.audio.file_name
+        elif m.voice:
+            msg_type = "voice";    file_id = m.voice.file_id
+        else:
+            await m.reply_text("❌ Faqat fayl yuboring (rasm, hujjat, video, audio)")
+            return
+
+        files = ctx.user_data.setdefault('zip_files', [])
+        files.append({'msg_type': msg_type, 'file_id': file_id, 'file_name': file_name})
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"✅ ZIP qilib yuborish ({len(files)} ta)", callback_data="zip_finish")],
+            [InlineKeyboardButton("❌ Bekor qilish", callback_data="zip_cancel")],
+        ])
+        await m.reply_text(
+            f"➕ <b>{TYPE_NAME.get(msg_type, 'Fayl')}</b> qo'shildi\n"
+            f"📎 Jami: <b>{len(files)} ta</b>\n\n"
+            "Yana fayl yuboring yoki ZIP qilib oling 👇",
+            reply_markup=kb, parse_mode="HTML"
+        )
+        return
 
     if state == "adding_category":
         text = msg.text.strip() if msg.text else ""
@@ -830,6 +1042,24 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML"
     )
 
+# ─────────────────────── WEB SERVER (Render uchun) ────────────────
+# Render hosting platforma bot ishlaydigan portga so'rov yuborib turadi.
+# UptimeRobot ham shu URL ga so'rov yuborib botni "uxlamasligini" ta'minlaydi.
+
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def home():
+    return "🤖 EduSave Bot ishlamoqda!"
+
+@flask_app.route('/health')
+def health():
+    return "OK"
+
+def run_flask():
+    port = int(os.environ.get('PORT', 8080))
+    flask_app.run(host='0.0.0.0', port=port)
+
 # ─────────────────────────── MAIN ────────────────────────────────
 
 def main():
@@ -840,6 +1070,11 @@ def main():
         return
     init_db()
     logger.info("DB initialized ✅")
+
+    # Flask web serverni alohida thread da ishga tushiramiz (Render uchun)
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("🌐 Web server ishga tushdi (port 8080)")
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu",  cmd_start))
@@ -861,10 +1096,25 @@ def main():
         "^save_cancel$":       cb_save_cancel,
         "^compress:":          cb_compress,
         "^zip_cat:":           cb_zip_cat,
+        "^zip_mode$":          cb_zip_mode,
+        "^zip_finish$":        cb_zip_finish,
+        "^zip_cancel$":        cb_zip_cancel,
+        "^check_sub$":         cb_check_sub,
         "^noop$":              cb_noop,
     }
     for pattern, handler in cb_map.items():
-        app.add_handler(CallbackQueryHandler(handler, pattern=pattern))
+        # check_sub o'zi obunani tekshiradi, qolganlar uchun wrap qilamiz
+        if pattern == "^check_sub$":
+            app.add_handler(CallbackQueryHandler(handler, pattern=pattern))
+        else:
+            # Har bir callback'dan oldin obunani tekshiramiz
+            def make_protected(h):
+                async def protected(update, ctx):
+                    if not await require_subscription(update, ctx):
+                        return
+                    return await h(update, ctx)
+                return protected
+            app.add_handler(CallbackQueryHandler(make_protected(handler), pattern=pattern))
     app.add_handler(MessageHandler(
         filters.TEXT | filters.PHOTO | filters.Document.ALL |
         filters.VIDEO | filters.AUDIO | filters.VOICE,
@@ -874,4 +1124,11 @@ def main():
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
+    import asyncio
+    # Python 3.14 da event loop ni yangidan yaratamiz
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    except Exception:
+        pass
     main()
