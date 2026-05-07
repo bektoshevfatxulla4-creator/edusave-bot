@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 📚 EduSave Bot — O'quv materiallarini kategoriyalarda saqlash boti
@@ -10,12 +9,20 @@ import logging
 import sqlite3
 import os
 import io
+import json
 import zipfile
 import threading
+import requests
 from datetime import datetime
 
 from PIL import Image
 from flask import Flask
+
+from pptx import Presentation
+from pptx.util import Inches, Pt, Emu
+from pptx.dml.color import RGBColor
+from pptx.enum.shapes import MSO_SHAPE
+from pptx.enum.text import PP_ALIGN
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -35,6 +42,304 @@ ITEMS_PER_PAGE = 5
 # ─────────────────────────── ADMIN ────────────────────────────────
 # Admin user ID — faqat siz admin paneli ko'ra olasiz
 ADMIN_ID = 7855999182  # ← Sizning Telegram user ID
+
+# ─────────────────────────── GEMINI AI ──────────────────────────
+# Gemini API kalit — Render Environment Variables'dan olinadi
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent"
+
+def generate_presentation_content(topic: str) -> dict:
+    """Gemini API yordamida prezentatsiya matnini yaratadi."""
+    if not GEMINI_API_KEY:
+        raise Exception("GEMINI_API_KEY o'rnatilmagan!")
+
+    prompt = f"""Quyidagi mavzu bo'yicha 5 slaydli prezentatsiya yarating: "{topic}"
+
+Faqat JSON formatida javob bering, boshqa hech qanday matn yo'q.
+JSON struktura:
+{{
+  "title_main": "Asosiy sarlavha (1-2 so'z, masalan: Sun'iy Intellekt)",
+  "title_sub": "Qo'shimcha sarlavha (1-3 so'z)",
+  "intro_question": "Kirish savoli (3-5 so'z, masalan: Bu nima?)",
+  "intro_definition": "Asosiy ta'rif (1 jumla, 15-25 so'z)",
+  "intro_extra": "Qo'shimcha izoh (1 jumla, 10-15 so'z)",
+  "stat1_value": "Birinchi statistika qiymati (masalan: 75%)",
+  "stat1_label": "Statistika izohi (3-7 so'z)",
+  "stat2_value": "Ikkinchi statistika qiymati (masalan: $1.5T)",
+  "stat2_label": "Statistika izohi (3-7 so'z)",
+  "directions": [
+    {{"icon": "🧠", "title": "1-yo'nalish", "desc": "Tavsif (8-12 so'z)"}},
+    {{"icon": "🗣️", "title": "2-yo'nalish", "desc": "Tavsif (8-12 so'z)"}},
+    {{"icon": "👁️", "title": "3-yo'nalish", "desc": "Tavsif (8-12 so'z)"}},
+    {{"icon": "🤖", "title": "4-yo'nalish", "desc": "Tavsif (8-12 so'z)"}}
+  ],
+  "applications": [
+    {{"icon": "🏥", "title": "Soha 1", "desc": "Qo'llanilishi (8-12 so'z)"}},
+    {{"icon": "🎓", "title": "Soha 2", "desc": "Qo'llanilishi (8-12 so'z)"}},
+    {{"icon": "🚗", "title": "Soha 3", "desc": "Qo'llanilishi (8-12 so'z)"}},
+    {{"icon": "💰", "title": "Soha 4", "desc": "Qo'llanilishi (8-12 so'z)"}}
+  ],
+  "conclusion_main": "Asosiy xulosa (2-3 so'z)",
+  "conclusion_sub": "Davomi (2-3 so'z, masalan: bugun yaratiladi)",
+  "conclusion_points": [
+    "1-asosiy fikr (3-5 so'z)",
+    "2-asosiy fikr (3-5 so'z)",
+    "3-asosiy fikr (3-5 so'z)"
+  ]
+}}
+
+MUHIM: Faqat JSON, boshqa matn yo'q. O'zbek tilida yozing."""
+
+    response = requests.post(
+        f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+        headers={"Content-Type": "application/json"},
+        json={
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.7,
+                "maxOutputTokens": 2048,
+                "responseMimeType": "application/json"
+            }
+        },
+        timeout=60
+    )
+
+    if response.status_code != 200:
+        raise Exception(f"Gemini API xato: {response.status_code} - {response.text[:200]}")
+
+    data = response.json()
+    text = data['candidates'][0]['content']['parts'][0]['text']
+    return json.loads(text)
+
+
+def hex_to_rgb(hex_color: str) -> RGBColor:
+    """Hex rangdan RGBColor yaratadi."""
+    hex_color = hex_color.lstrip('#')
+    return RGBColor(int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16))
+
+
+def add_rounded_rect(slide, x, y, w, h, fill_color, text=None, font_size=14,
+                     font_color="FFFFFF", bold=False, italic=False, align=PP_ALIGN.LEFT):
+    """Yumaloq burchakli to'rtburchak qo'shadi."""
+    shape = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,
+                                    Inches(x), Inches(y), Inches(w), Inches(h))
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = hex_to_rgb(fill_color)
+    shape.line.fill.background()
+
+    # Yumaloqlik darajasi
+    shape.adjustments[0] = 0.1
+
+    if text:
+        tf = shape.text_frame
+        tf.margin_left = Inches(0.2)
+        tf.margin_right = Inches(0.2)
+        tf.word_wrap = True
+        p = tf.paragraphs[0]
+        p.alignment = align
+        run = p.add_run()
+        run.text = text
+        run.font.size = Pt(font_size)
+        run.font.bold = bold
+        run.font.italic = italic
+        run.font.color.rgb = hex_to_rgb(font_color)
+        run.font.name = "Calibri"
+    return shape
+
+
+def add_text_box(slide, x, y, w, h, text, font_size=14, color="FFFFFF",
+                 bold=False, italic=False, align=PP_ALIGN.LEFT, font_name="Calibri"):
+    """Matn qutisi qo'shadi."""
+    tb = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
+    tf = tb.text_frame
+    tf.word_wrap = True
+    tf.margin_left = Inches(0.05)
+    tf.margin_right = Inches(0.05)
+    p = tf.paragraphs[0]
+    p.alignment = align
+    run = p.add_run()
+    run.text = text
+    run.font.size = Pt(font_size)
+    run.font.bold = bold
+    run.font.italic = italic
+    run.font.color.rgb = hex_to_rgb(color)
+    run.font.name = font_name
+    return tb
+
+
+def create_bento_presentation(content: dict) -> bytes:
+    """Bento Box uslubida prezentatsiya yaratadi."""
+    # Ranglar (Apple uslubi)
+    BG = "0A0A0A"
+    CARD_DARK = "1A1A1C"
+    CARD_GRAY = "232325"
+    BLUE = "0A84FF"
+    PURPLE = "BF5AF2"
+    ORANGE = "FF9F0A"
+    GREEN = "30D158"
+    PINK = "FF375F"
+    WHITE = "FFFFFF"
+    GRAY = "8E8E93"
+    LIGHT = "EBEBF5"
+
+    prs = Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
+    blank = prs.slide_layouts[6]
+
+    def set_bg(slide, color):
+        bg = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, prs.slide_height)
+        bg.fill.solid()
+        bg.fill.fore_color.rgb = hex_to_rgb(color)
+        bg.line.fill.background()
+        # Orqaga jo'natamiz
+        spTree = bg._element.getparent()
+        spTree.remove(bg._element)
+        spTree.insert(2, bg._element)
+
+    # ─────── SLAYD 1: TITUL ───────
+    s1 = prs.slides.add_slide(blank)
+    set_bg(s1, BG)
+
+    # Asosiy karta
+    add_rounded_rect(s1, 0.4, 0.4, 8.5, 4, CARD_DARK)
+    add_text_box(s1, 0.8, 0.8, 6, 0.5, "AI", 14, BLUE, bold=True)
+    add_text_box(s1, 0.8, 1.6, 8, 1.3, content['title_main'], 64, WHITE, bold=True)
+    add_text_box(s1, 0.8, 2.7, 8, 1.3, content['title_sub'] + ".", 64, BLUE, bold=True)
+
+    # Yon karta 1 (Kelajak)
+    add_rounded_rect(s1, 9.1, 0.4, 3.8, 1.9, BLUE)
+    add_text_box(s1, 9.4, 0.6, 1, 0.6, "✨", 32)
+    add_text_box(s1, 9.4, 1.2, 3.4, 1, "Kelajak\nbugun", 22, WHITE, bold=True)
+
+    # Yon karta 2 (Sana)
+    add_rounded_rect(s1, 9.1, 2.5, 3.8, 1.9, CARD_GRAY)
+    add_text_box(s1, 9.4, 2.7, 3.4, 1.2, "2026", 60, ORANGE, bold=True)
+    add_text_box(s1, 9.4, 3.85, 3.4, 0.4, "Akademik yil", 12, GRAY)
+
+    # Pastki katta karta
+    add_rounded_rect(s1, 0.4, 4.5, 12.5, 2.6, CARD_DARK)
+    add_text_box(s1, 0.8, 4.8, 12, 0.5,
+                 "Texnologiya • Kelajak • Imkoniyat", 12, GRAY)
+    add_text_box(s1, 0.8, 5.4, 8.5, 1.5,
+                 f"Ushbu taqdimotda biz {content['title_main'].lower()} mavzusini batafsil o'rganamiz.",
+                 18, LIGHT)
+    add_text_box(s1, 11.8, 5.8, 0.8, 0.8, "→", 48, BLUE, bold=True, align=PP_ALIGN.CENTER)
+
+    # ─────── SLAYD 2: KIRISH ───────
+    s2 = prs.slides.add_slide(blank)
+    set_bg(s2, BG)
+
+    add_text_box(s2, 0.4, 0.3, 6, 0.4, "01 — Kirish", 12, GRAY)
+
+    # Asosiy ta'rif karta
+    add_rounded_rect(s2, 0.4, 0.9, 7, 6.2, CARD_DARK)
+    add_text_box(s2, 0.8, 1.3, 6.3, 1, content['intro_question'], 48, WHITE, bold=True)
+
+    # Kichik chiziq
+    line = s2.shapes.add_shape(MSO_SHAPE.RECTANGLE,
+                                Inches(0.8), Inches(2.5), Inches(6.3), Inches(0.06))
+    line.fill.solid()
+    line.fill.fore_color.rgb = hex_to_rgb(BLUE)
+    line.line.fill.background()
+
+    add_text_box(s2, 0.8, 2.9, 6.3, 2, content['intro_definition'], 18, LIGHT)
+    add_text_box(s2, 0.8, 5, 6.3, 1.5, content['intro_extra'], 14, GRAY)
+
+    # Statistika 1
+    add_rounded_rect(s2, 7.6, 0.9, 5.3, 3, BLUE)
+    add_text_box(s2, 7.9, 1.1, 4.7, 1.6, content['stat1_value'], 88, WHITE, bold=True)
+    add_text_box(s2, 7.9, 2.8, 4.7, 1, content['stat1_label'], 14, WHITE)
+
+    # Statistika 2
+    add_rounded_rect(s2, 7.6, 4.1, 5.3, 3, CARD_GRAY)
+    add_text_box(s2, 7.9, 4.4, 4.7, 1.6, content['stat2_value'], 76, GREEN, bold=True)
+    add_text_box(s2, 7.9, 5.95, 4.7, 1, content['stat2_label'], 14, LIGHT)
+
+    # ─────── SLAYD 3: YO'NALISHLAR ───────
+    s3 = prs.slides.add_slide(blank)
+    set_bg(s3, BG)
+    add_text_box(s3, 0.4, 0.3, 8, 0.4, "02 — Asosiy yo'nalishlar", 12, GRAY)
+
+    dirs = content['directions']
+
+    # 1-karta (katta, chap yuqori)
+    add_rounded_rect(s3, 0.4, 0.9, 6.3, 3.2, BLUE)
+    add_text_box(s3, 0.7, 1.1, 1, 0.4, "01", 12, WHITE)
+    add_text_box(s3, 5.5, 1.1, 1, 1, dirs[0]['icon'], 36)
+    add_text_box(s3, 0.7, 2.3, 5.5, 0.7, dirs[0]['title'], 28, WHITE, bold=True)
+    add_text_box(s3, 0.7, 3.05, 5.5, 0.9, dirs[0]['desc'], 13, LIGHT)
+
+    # 2-karta (o'ng yuqori)
+    add_rounded_rect(s3, 6.9, 0.9, 6, 3.2, CARD_DARK)
+    add_text_box(s3, 7.2, 1.1, 1, 0.4, "02", 12, GRAY)
+    add_text_box(s3, 11.5, 1.1, 1, 1, dirs[1]['icon'], 36)
+    add_text_box(s3, 7.2, 2.3, 5.5, 0.7, dirs[1]['title'], 28, PURPLE, bold=True)
+    add_text_box(s3, 7.2, 3.05, 5.5, 0.9, dirs[1]['desc'], 13, LIGHT)
+
+    # 3-karta (chap pastda)
+    add_rounded_rect(s3, 0.4, 4.3, 6.3, 2.8, CARD_GRAY)
+    add_text_box(s3, 0.7, 4.5, 1, 0.4, "03", 12, GRAY)
+    add_text_box(s3, 5.5, 4.5, 1, 1, dirs[2]['icon'], 36)
+    add_text_box(s3, 0.7, 5.5, 5.5, 0.7, dirs[2]['title'], 24, ORANGE, bold=True)
+    add_text_box(s3, 0.7, 6.2, 5.5, 0.7, dirs[2]['desc'], 13, LIGHT)
+
+    # 4-karta (o'ng pastda)
+    add_rounded_rect(s3, 6.9, 4.3, 6, 2.8, PINK)
+    add_text_box(s3, 7.2, 4.5, 1, 0.4, "04", 12, WHITE)
+    add_text_box(s3, 11.5, 4.5, 1, 1, dirs[3]['icon'], 36)
+    add_text_box(s3, 7.2, 5.5, 5.5, 0.7, dirs[3]['title'], 24, WHITE, bold=True)
+    add_text_box(s3, 7.2, 6.2, 5.5, 0.7, dirs[3]['desc'], 13, LIGHT)
+
+    # ─────── SLAYD 4: AMALIY QO'LLANISH ───────
+    s4 = prs.slides.add_slide(blank)
+    set_bg(s4, BG)
+    add_text_box(s4, 0.4, 0.3, 8, 0.4, "03 — Hayotda qo'llanilishi", 12, GRAY)
+
+    apps = content['applications']
+    bgs = [GREEN, CARD_DARK, CARD_GRAY, PURPLE]
+    title_colors = [WHITE, BLUE, ORANGE, WHITE]
+    desc_colors = [LIGHT, GRAY, GRAY, LIGHT]
+
+    for i, app in enumerate(apps):
+        x = 0.4 + (i % 2) * 6.5
+        y = 0.9 + (i // 2) * 3.15
+        add_rounded_rect(s4, x, y, 6.4, 2.9, bgs[i])
+        add_text_box(s4, x + 0.3, y + 0.3, 1, 1, app['icon'], 36)
+        add_text_box(s4, x + 0.3, y + 1.5, 5.8, 0.7, app['title'], 26, title_colors[i], bold=True)
+        add_text_box(s4, x + 0.3, y + 2.2, 5.8, 0.7, app['desc'], 13, desc_colors[i])
+
+    # ─────── SLAYD 5: XULOSA ───────
+    s5 = prs.slides.add_slide(blank)
+    set_bg(s5, BG)
+    add_text_box(s5, 0.4, 0.3, 6, 0.4, "04 — Xulosa", 12, GRAY)
+
+    # Katta xulosa karta
+    add_rounded_rect(s5, 0.4, 0.9, 12.5, 4, CARD_DARK)
+    add_text_box(s5, 0.8, 1.4, 11.7, 1.5, content['conclusion_main'], 72, WHITE, bold=True)
+    add_text_box(s5, 0.8, 2.8, 11.7, 1.5, content['conclusion_sub'] + ".", 72, BLUE, bold=True)
+
+    # 3 ta kichik karta
+    point_colors = [GREEN, ORANGE, PINK]
+    points = content['conclusion_points']
+    for i, point in enumerate(points[:3]):
+        x = 0.4 + i * 4.2
+        add_rounded_rect(s5, x, 5.1, 4, 1.4, CARD_GRAY)
+        add_text_box(s5, x + 0.3, 5.25, 1, 0.3, f"0{i+1}", 11, point_colors[i])
+        add_text_box(s5, x + 0.3, 5.6, 3.5, 0.8, point, 14, WHITE, bold=True)
+
+    add_text_box(s5, 0.4, 6.7, 8, 0.4, "→  Rahmat e'tiboringiz uchun!", 14, BLUE, bold=True)
+    add_text_box(s5, 8, 6.7, 4.9, 0.4, f"{content['title_main']} • 2026",
+                 11, GRAY, align=PP_ALIGN.RIGHT)
+
+    # Faylni byte'larga saqlash
+    output = io.BytesIO()
+    prs.save(output)
+    output.seek(0)
+    return output.getvalue()
+
+
+# ─────────────────────────────────────────────────────────────────
 
 # ─────────────────────────── MAJBURIY OBUNA ──────────────────────
 # Kanal username — @ belgisi bilan yozing (masalan: "@edusave_kanal")
@@ -417,6 +722,7 @@ def main_menu_kb():
          InlineKeyboardButton("⭐ Sevimlilar",    callback_data="favorites")],
         [InlineKeyboardButton("📊 Statistika",    callback_data="stats"),
          InlineKeyboardButton("📦 ZIP qilish",    callback_data="zip_mode")],
+        [InlineKeyboardButton("🎨 AI Prezentatsiya",  callback_data="ai_preso")],
     ])
 
 def back_btn(target="main_menu"):
@@ -629,6 +935,115 @@ async def cb_admin_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "⚠️ Diqqat: barcha foydalanuvchilarga yuboriladi!",
         reply_markup=kb, parse_mode="HTML"
     )
+
+# ─────────────────────────────────────────────────────────────────
+# ─────────────────────── 🎨 AI PREZENTATSIYA ──────────────────────
+
+async def cb_ai_preso(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """AI Prezentatsiya yaratish boshlash."""
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+
+    # Hozircha faqat admin uchun
+    if uid != ADMIN_ID:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Asosiy menyu", callback_data="main_menu")]])
+        await q.edit_message_text(
+            "🎨 <b>AI Prezentatsiya yaratish</b>\n\n"
+            "🚧 Bu funksiya hozircha <b>test rejimida</b>.\n"
+            "Tez orada hammaga ochiladi!\n\n"
+            "📌 Funksiya tayyor bo'lgach, bot orqali bildirishnoma olasiz.",
+            reply_markup=kb, parse_mode="HTML"
+        )
+        return
+
+    # Admin uchun
+    ctx.user_data['state'] = 'ai_preso_topic'
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Bekor", callback_data="main_menu")]])
+    await q.edit_message_text(
+        "🎨 <b>AI Prezentatsiya yaratish</b> [TEST]\n\n"
+        "Mavzuni yozing, men 30-60 soniyada zamonaviy "
+        "Bento Box uslubidagi prezentatsiya yarataman.\n\n"
+        "<b>Misollar:</b>\n"
+        "• Sun'iy intellekt\n"
+        "• Ekologiya muammolari\n"
+        "• Sog'lom turmush tarzi\n"
+        "• Kvant kompyuterlar\n\n"
+        "✍️ Mavzu yozing:",
+        reply_markup=kb, parse_mode="HTML"
+    )
+
+
+async def handle_ai_preso(update: Update, ctx: ContextTypes.DEFAULT_TYPE, topic: str):
+    """Prezentatsiya yaratadi va yuboradi."""
+    msg = update.message
+    uid = update.effective_user.id
+
+    # Status xabari
+    status = await msg.reply_text(
+        "🎨 <b>Prezentatsiya yaratilmoqda...</b>\n\n"
+        "⏳ Gemini AI matn yaratmoqda (15-30 soniya)",
+        parse_mode="HTML"
+    )
+
+    try:
+        # 1. Gemini'dan matn olish
+        logger.info(f"🎨 AI Preso boshlandi: user={uid}, topic={topic}")
+        content = generate_presentation_content(topic)
+        logger.info(f"🎨 Gemini javob keldi: title={content.get('title_main')}")
+
+        await status.edit_text(
+            "🎨 <b>Prezentatsiya yaratilmoqda...</b>\n\n"
+            "✅ Matn tayyor\n"
+            "⏳ Slaydlar dizaynda joylanmoqda...",
+            parse_mode="HTML"
+        )
+
+        # 2. Bento prezentatsiya yaratish
+        pptx_data = create_bento_presentation(content)
+        logger.info(f"🎨 PPTX yaratildi: {len(pptx_data)} bayt")
+
+        # 3. Foydalanuvchiga yuborish
+        await status.edit_text(
+            "🎨 <b>Prezentatsiya yaratilmoqda...</b>\n\n"
+            "✅ Matn tayyor\n"
+            "✅ Dizayn tayyor\n"
+            "📤 Yuborilmoqda...",
+            parse_mode="HTML"
+        )
+
+        filename = f"{topic[:30].replace('/', '_')}.pptx"
+        await msg.reply_document(
+            io.BytesIO(pptx_data),
+            filename=filename,
+            caption=(
+                f"🎨 <b>Prezentatsiya tayyor!</b>\n\n"
+                f"📌 Mavzu: <b>{topic}</b>\n"
+                f"📊 Slaydlar: <b>5 ta</b>\n"
+                f"🎭 Uslub: <b>Bento Box (zamonaviy)</b>\n\n"
+                f"💡 PowerPoint yoki Google Slides'da oching!"
+            ),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏠 Asosiy menyu", callback_data="main_menu")
+            ]])
+        )
+
+        await status.delete()
+        ctx.user_data.clear()
+
+    except Exception as e:
+        logger.error(f"AI Preso xato: {e}", exc_info=True)
+        await status.edit_text(
+            f"❌ <b>Xato yuz berdi</b>\n\n"
+            f"Sabab: <code>{str(e)[:200]}</code>\n\n"
+            f"Iltimos, qayta urinib ko'ring yoki boshqa mavzu yozing.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Asosiy menyu", callback_data="main_menu")
+            ]])
+        )
+        ctx.user_data.clear()
 
 # ─────────────────────────────────────────────────────────────────
 
@@ -1124,6 +1539,18 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ── AI Prezentatsiya: mavzu kutish ─────────────────────────────
+    if state == "ai_preso_topic":
+        topic = (msg.text or "").strip()
+        if not topic:
+            await msg.reply_text("❌ Iltimos, prezentatsiya mavzusini matn ko'rinishida yozing.")
+            return
+        if len(topic) > 200:
+            await msg.reply_text("❌ Mavzu juda uzun. Maksimum 200 belgi.")
+            return
+        await handle_ai_preso(update, ctx, topic)
+        return
+
     # ── ZIP rejim: yuborilgan fayllarni to'plash ──────────────────
     if state == "zip_mode":
         m = msg
@@ -1330,6 +1757,7 @@ def main():
         "^admin_recent$":      cb_admin_recent,
         "^admin_back$":        cb_admin_back,
         "^admin_broadcast$":   cb_admin_broadcast,
+        "^ai_preso$":          cb_ai_preso,
         "^noop$":              cb_noop,
     }
     for pattern, handler in cb_map.items():
