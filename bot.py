@@ -46,10 +46,17 @@ ADMIN_ID = 7855999182  # ← Sizning Telegram user ID
 # ─────────────────────────── GEMINI AI ──────────────────────────
 # Gemini API kalit — Render Environment Variables'dan olinadi
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+# Asosiy va zaxira modellar (503 xato bo'lsa, zaxira ishlatamiz)
+GEMINI_MODELS = [
+    "gemini-2.5-flash",         # Asosiy
+    "gemini-2.5-flash-lite",    # Zaxira (kamroq yuklangan)
+    "gemini-2.0-flash",         # Yana zaxira
+]
+GEMINI_URL_TPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 def generate_presentation_content(topic: str) -> dict:
-    """Gemini API yordamida prezentatsiya matnini yaratadi."""
+    """Gemini API yordamida prezentatsiya matnini yaratadi.
+    503 xato bo'lsa zaxira modelga o'tadi va qaytadan urinadi."""
     if not GEMINI_API_KEY:
         raise Exception("GEMINI_API_KEY o'rnatilmagan!")
 
@@ -90,26 +97,56 @@ JSON struktura:
 
 MUHIM: Faqat JSON, boshqa matn yo'q. O'zbek tilida yozing."""
 
-    response = requests.post(
-        f"{GEMINI_URL}?key={GEMINI_API_KEY}",
-        headers={"Content-Type": "application/json"},
-        json={
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.7,
-                "maxOutputTokens": 2048,
-                "responseMimeType": "application/json"
-            }
-        },
-        timeout=60
-    )
+    last_error = None
+    # Har bir modelni 2 marta sinab ko'ramiz
+    for model in GEMINI_MODELS:
+        url = GEMINI_URL_TPL.format(model=model)
+        for attempt in range(2):
+            try:
+                logger.info(f"Gemini so'rov: model={model}, urinish={attempt+1}")
+                response = requests.post(
+                    f"{url}?key={GEMINI_API_KEY}",
+                    headers={"Content-Type": "application/json"},
+                    json={
+                        "contents": [{"parts": [{"text": prompt}]}],
+                        "generationConfig": {
+                            "temperature": 0.7,
+                            "maxOutputTokens": 2048,
+                            "responseMimeType": "application/json"
+                        }
+                    },
+                    timeout=60
+                )
 
-    if response.status_code != 200:
-        raise Exception(f"Gemini API xato: {response.status_code} - {response.text[:200]}")
+                if response.status_code == 200:
+                    data = response.json()
+                    text = data['candidates'][0]['content']['parts'][0]['text']
+                    logger.info(f"✅ Gemini muvaffaqiyat: model={model}")
+                    return json.loads(text)
 
-    data = response.json()
-    text = data['candidates'][0]['content']['parts'][0]['text']
-    return json.loads(text)
+                # 503 xato bo'lsa — keyingi modelga o'tamiz
+                if response.status_code == 503:
+                    last_error = f"503 (yuk ko'p): {model}"
+                    logger.warning(f"⚠️ Gemini 503: {model}, keyingi modelga o'tamiz")
+                    break  # Bu modelni boshqa sinamaymiz, zaxiraga o'tamiz
+
+                # Boshqa xato (404, 400 va h.k.) — qaytadan urinishdan foyda yo'q
+                last_error = f"HTTP {response.status_code}: {response.text[:200]}"
+                logger.error(f"❌ Gemini xato: {last_error}")
+                break
+
+            except requests.exceptions.Timeout:
+                last_error = f"Timeout: {model}"
+                logger.warning(f"⏱ Timeout: {model}, urinish={attempt+1}")
+                continue
+
+            except Exception as e:
+                last_error = str(e)
+                logger.error(f"❌ Gemini exception: {e}")
+                break
+
+    # Hamma modellar ham ishlamadi
+    raise Exception(f"Gemini API javob bermayapti. Iltimos, 1-2 daqiqadan keyin qayta urinib ko'ring.\nXato: {last_error}")
 
 
 def hex_to_rgb(hex_color: str) -> RGBColor:
