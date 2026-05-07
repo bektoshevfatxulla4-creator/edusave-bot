@@ -46,7 +46,7 @@ ADMIN_ID = 7855999182  # ← Sizning Telegram user ID
 # ─────────────────────────── GEMINI AI ──────────────────────────
 # Gemini API kalit — Render Environment Variables'dan olinadi
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
 
 def generate_presentation_content(topic: str) -> dict:
     """Gemini API yordamida prezentatsiya matnini yaratadi."""
